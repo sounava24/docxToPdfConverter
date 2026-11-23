@@ -1,0 +1,254 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Word to PDF, page snapshots</title>
+<style>
+:root{--bg:#eef1f5;--panel:#fff;--ink:#14213d;--mute:#5d6b85;--line:#d5dbe6;--accent:#1d4ed8;--ok:#0f7b4f;--err:#b42318}
+@media (prefers-color-scheme:dark){:root{--bg:#0e1420;--panel:#161e2e;--ink:#e8edf7;--mute:#97a3bb;--line:#2a3550;--accent:#6e96ff;--ok:#4cc38a;--err:#ff7b72}}
+*{box-sizing:border-box}
+body{margin:0;background:var(--bg);color:var(--ink);font:16px/1.5 "Segoe UI",system-ui,-apple-system,sans-serif}
+main{max-width:760px;margin:0 auto;padding:48px 20px}
+h1{font-size:clamp(28px,5vw,40px);line-height:1.1;margin:0 0 8px;letter-spacing:-.02em}
+p.lead{margin:0 0 28px;color:var(--mute)}
+#drop{display:block;border:2px dashed var(--line);background:var(--panel);border-radius:6px;padding:44px 20px;text-align:center;cursor:pointer}
+#drop.over,#drop:focus-within,#drop:hover{border-color:var(--accent)}
+#drop strong{display:block;font-size:20px}
+#drop span{color:var(--mute)}
+#drop input{position:absolute;opacity:0;pointer-events:none}
+.bar{display:flex;gap:10px;flex-wrap:wrap;margin:20px 0}
+button{font:inherit;border:1px solid var(--line);background:var(--panel);color:var(--ink);padding:9px 16px;border-radius:6px;cursor:pointer}
+button.primary{background:var(--accent);border-color:var(--accent);color:#fff;font-weight:600}
+button:disabled{opacity:.45;cursor:not-allowed}
+button:focus-visible,a:focus-visible{outline:3px solid var(--accent);outline-offset:2px}
+ul{list-style:none;margin:0;padding:0;background:var(--panel);border:1px solid var(--line);border-radius:6px}
+li{display:grid;grid-template-columns:1fr auto;gap:4px 12px;padding:12px 16px;border-top:1px solid var(--line);align-items:center}
+li:first-child{border-top:0}
+.name{overflow:hidden;text-overflow:ellipsis;white-space:nowrap;font-weight:600}
+.meta{color:var(--mute);font-size:14px}
+.st-done{color:var(--ok)}.st-error{color:var(--err)}
+.track{grid-column:1/-1;height:3px;background:var(--line);border-radius:2px;overflow:hidden;display:none}
+li.busy .track{display:block}
+.track i{display:block;height:100%;width:0;background:var(--accent);transition:width .2s}
+a.dl,button.rm{font-size:14px;padding:5px 12px;text-decoration:none;color:var(--accent);border:1px solid var(--line);border-radius:6px;background:transparent}
+#empty{padding:20px 16px;color:var(--mute)}
+.note{margin-top:20px;font-size:14px;color:var(--mute)}
+/* off-screen render stage: white pages, no shadow, no gap */
+#stage{position:absolute;left:-100000px;top:0}
+#stage .docx-wrapper{background:none!important;padding:0!important}
+#stage .docx-wrapper>section.docx{box-shadow:none!important;margin:0!important}
+</style>
+</head>
+<body>
+<main>
+  <h1>Convert Word files to PDF, all at once</h1>
+  <p class="lead">Each page is captured as a high-resolution picture, so the PDF looks like the page did on screen. Everything happens in your browser. Nothing is uploaded.</p>
+
+  <label id="drop">
+    <input id="pick" type="file" multiple accept=".docx">
+    <strong>Drop .docx files here or click to choose</strong>
+    <span>Many files at once</span>
+  </label>
+
+  <div class="bar">
+    <button id="go" class="primary" disabled>Convert all</button>
+    <button id="zip" disabled>Download all as ZIP</button>
+    <button id="clear" disabled>Clear list</button>
+  </div>
+
+  <ul id="list"><li id="empty">No files yet. Add some above.</li></ul>
+  <p class="note">The PDF pages are images, so text can't be selected or searched. If a font isn't installed on this device, the browser swaps in another one.</p>
+</main>
+<div id="stage" aria-hidden="true"></div>
+
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jszip/3.10.1/jszip.min.js"></script>
+<script src="https://cdn.jsdelivr.net/npm/docx-preview@0.3.2/dist/docx-preview.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/html2canvas/1.4.1/html2canvas.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/jspdf/2.5.1/jspdf.umd.min.js"></script>
+<script>
+const $ = s => document.querySelector(s);
+const list = $('#list'), drop = $('#drop'), pick = $('#pick'), stage = $('#stage');
+const items = [];
+const SCALE = 2;       // snapshot sharpness: 2 is crisp, 3 is sharper but bigger files
+const QUALITY = 0.92;  // JPEG quality inside the PDF
+
+const size = n => n > 1048576 ? (n/1048576).toFixed(1)+' MB' : Math.max(1,Math.round(n/1024))+' KB';
+const pdfName = n => n.replace(/\.[^.]+$/, '') + '.pdf';
+
+function add(files){
+  for (const f of files){
+    if (!/\.docx$/i.test(f.name)) continue;
+    if (items.some(i => i.file.name === f.name && i.file.size === f.size)) continue;
+    const el = document.createElement('li');
+    el.innerHTML = '<span class="name"></span><span class="act"></span><span class="meta"></span><span></span><div class="track"><i></i></div>';
+    el.querySelector('.name').textContent = f.name;
+    const it = {file:f, el, blob:null, state:'ready', msg:''};
+    items.push(it); list.appendChild(el); render(it);
+  }
+  sync();
+}
+
+function render(it){
+  const meta = it.el.querySelector('.meta'), act = it.el.querySelector('.act');
+  it.el.classList.toggle('busy', it.state === 'busy');
+  act.innerHTML = '';
+  if (it.state === 'done'){
+    const a = document.createElement('a');
+    a.className = 'dl'; a.textContent = 'Download PDF';
+    a.href = URL.createObjectURL(it.blob); a.download = pdfName(it.file.name);
+    act.appendChild(a);
+    meta.className = 'meta st-done'; meta.textContent = `Converted · ${it.pages} pages · ${size(it.blob.size)}`;
+  } else if (it.state === 'error'){
+    meta.className = 'meta st-error'; meta.textContent = it.msg;
+  } else {
+    meta.className = 'meta';
+    meta.textContent = it.state === 'busy' ? (it.msg || 'Preparing…') : size(it.file.size);
+    if (it.state === 'ready'){
+      const b = document.createElement('button'); b.className = 'rm'; b.textContent = 'Remove';
+      b.onclick = () => { items.splice(items.indexOf(it),1); it.el.remove(); sync(); };
+      act.appendChild(b);
+    }
+  }
+}
+
+function sync(){
+  $('#empty')?.remove();
+  if (!items.length) list.innerHTML = '<li id="empty">No files yet. Add some above.</li>';
+  $('#go').disabled = !items.some(i => i.state==='ready' || i.state==='error');
+  $('#zip').disabled = !items.some(i => i.state==='done');
+  $('#clear').disabled = !items.length;
+}
+
+
+/* Word stores picture crops as <a:srcRect> and keeps the full image in the file.
+   The renderer ignores it, so we bake each crop into a new image before rendering. */
+const NS_A = 'http://schemas.openxmlformats.org/drawingml/2006/main';
+const NS_R = 'http://schemas.openxmlformats.org/officeDocument/2006/relationships';
+async function applyCrops(buf){
+  try{
+    const zip = await JSZip.loadAsync(buf);
+    const dp = new DOMParser(), ser = new XMLSerializer();
+    const ctFile = zip.file('[Content_Types].xml');
+    let ct = await ctFile.async('string'), changed = false, n = 0;
+    const cache = {};
+    const parts = Object.keys(zip.files).filter(f => /^word\/(document|header\d*|footer\d*)\.xml$/.test(f));
+    for (const part of parts){
+      const relPath = part.replace('word/', 'word/_rels/') + '.rels';
+      if (!zip.file(relPath)) continue;
+      const xml = dp.parseFromString(await zip.file(part).async('string'), 'application/xml');
+      const rels = dp.parseFromString(await zip.file(relPath).async('string'), 'application/xml');
+      const relMap = {};
+      for (const r of rels.getElementsByTagName('Relationship')) relMap[r.getAttribute('Id')] = r.getAttribute('Target');
+      let touched = false;
+      for (const rect of [...xml.getElementsByTagNameNS(NS_A, 'srcRect')]){
+        const v = k => Math.max(0, (parseInt(rect.getAttribute(k)) || 0) / 100000);
+        const l = v('l'), t = v('t'), r = v('r'), b = v('b');
+        if (!(l || t || r || b)) continue;
+        const blip = rect.parentNode.getElementsByTagNameNS(NS_A, 'blip')[0];
+        const target = blip && relMap[blip.getAttributeNS(NS_R, 'embed')];
+        if (!target) continue;
+        const parts2 = (target.startsWith('/') ? target.slice(1) : 'word/' + target).split('/');
+        const stack = []; for (const seg of parts2){ if (seg === '..') stack.pop(); else if (seg !== '.') stack.push(seg); }
+        const imgPath = stack.join('/');
+        const key = [imgPath, l, t, r, b].join('|');
+        if (!cache[key]){
+          try{
+            const bmp = await createImageBitmap(new Blob([await zip.file(imgPath).async('arraybuffer')]));
+            const sw = Math.round(bmp.width * (1 - l - r)), sh = Math.round(bmp.height * (1 - t - b));
+            if (sw < 1 || sh < 1) continue;
+            const c = document.createElement('canvas'); c.width = sw; c.height = sh;
+            c.getContext('2d').drawImage(bmp, bmp.width * l, bmp.height * t, sw, sh, 0, 0, sw, sh);
+            const png = await new Promise(res => c.toBlob(res, 'image/png'));
+            const name = `crop_${++n}.png`;
+            zip.file('word/media/' + name, await png.arrayBuffer());
+            const rel = rels.createElementNS(rels.documentElement.namespaceURI, 'Relationship');
+            rel.setAttribute('Id', 'rIdCrop' + n);
+            rel.setAttribute('Type', NS_R + '/image');
+            rel.setAttribute('Target', 'media/' + name);
+            rels.documentElement.appendChild(rel);
+            cache[key] = 'rIdCrop' + n;
+            c.width = c.height = 0;
+          }catch(e){ continue; }   // unsupported format (e.g. EMF): leave as is
+        }
+        blip.setAttributeNS(NS_R, 'r:embed', cache[key]);
+        rect.parentNode.removeChild(rect);
+        touched = true;
+      }
+      if (touched){
+        zip.file(part, ser.serializeToString(xml));
+        zip.file(relPath, ser.serializeToString(rels));
+        changed = true;
+      }
+    }
+    if (!changed) return buf;
+    if (!/Extension="png"/i.test(ct)){
+      ct = ct.replace('</Types>', '<Default Extension="png" ContentType="image/png"/></Types>');
+      zip.file('[Content_Types].xml', ct);
+    }
+    return await zip.generateAsync({type:'arraybuffer'});
+  }catch(e){ console.warn('Crop step skipped:', e); return buf; }
+}
+
+async function toPdf(it){
+  stage.innerHTML = '';
+  await docx.renderAsync(await applyCrops(await it.file.arrayBuffer()), stage, stage, {
+    inWrapper:true, breakPages:true, useBase64URL:true,
+    renderHeaders:true, renderFooters:true, renderFootnotes:true, renderEndnotes:true
+  });
+  await document.fonts.ready;
+  await new Promise(r => setTimeout(r, 200));
+  const pages = [...stage.querySelectorAll('section.docx')];
+  if (!pages.length) throw new Error('No pages found. The file may be empty or damaged.');
+
+  let pdf;
+  for (let i = 0; i < pages.length; i++){
+    it.msg = `Page ${i+1} of ${pages.length}`; render(it);
+    it.el.querySelector('.track i').style.width = (i/pages.length*100)+'%';
+    const p = pages[i], w = p.offsetWidth, h = p.offsetHeight, o = w > h ? 'l' : 'p';
+    const canvas = await html2canvas(p, {scale:SCALE, backgroundColor:'#ffffff', useCORS:true, logging:false});
+    const img = canvas.toDataURL('image/jpeg', QUALITY);
+    if (!pdf) pdf = new jspdf.jsPDF({unit:'px', format:[w,h], orientation:o, hotfixes:['px_scaling'], compress:true});
+    else pdf.addPage([w,h], o);
+    pdf.addImage(img, 'JPEG', 0, 0, w, h);
+    canvas.width = canvas.height = 0;
+  }
+  it.pages = pages.length;
+  stage.innerHTML = '';
+  return pdf.output('blob');
+}
+
+async function convert(it){
+  it.state = 'busy'; it.msg = ''; render(it);
+  try{ it.blob = await toPdf(it); it.state = 'done'; }
+  catch(e){ it.state = 'error'; it.msg = e.message || 'Conversion failed.'; }
+  render(it); sync();
+}
+
+$('#go').onclick = async () => {
+  $('#go').disabled = true;
+  // one at a time: each page snapshot uses a lot of memory
+  for (const it of items.filter(i => i.state==='ready' || i.state==='error')) await convert(it);
+  sync();
+};
+
+$('#zip').onclick = async () => {
+  const z = new JSZip(), used = {};
+  for (const it of items.filter(i => i.state==='done')){
+    let n = pdfName(it.file.name);
+    if (used[n]){ n = n.replace(/\.pdf$/, ` (${++used[n]}).pdf`); } else used[n] = 1;
+    z.file(n, it.blob);
+  }
+  const a = document.createElement('a');
+  a.href = URL.createObjectURL(await z.generateAsync({type:'blob'}));
+  a.download = 'converted-pdfs.zip'; a.click();
+};
+
+$('#clear').onclick = () => { items.length = 0; list.innerHTML = ''; sync(); };
+pick.onchange = () => { add(pick.files); pick.value = ''; };
+['dragenter','dragover'].forEach(e => drop.addEventListener(e, ev => {ev.preventDefault(); drop.classList.add('over');}));
+['dragleave','drop'].forEach(e => drop.addEventListener(e, ev => {ev.preventDefault(); drop.classList.remove('over');}));
+drop.addEventListener('drop', ev => add(ev.dataTransfer.files));
+</script>
+</body>
+</html>
